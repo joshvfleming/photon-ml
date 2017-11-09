@@ -14,16 +14,23 @@
  */
 package com.linkedin.photon.ml.optimization
 
-import breeze.linalg.Vector
+import scala.util.Random
+
+import breeze.linalg.{DenseVector, Vector}
 import org.apache.spark.broadcast.Broadcast
 
 import com.linkedin.photon.ml.constants.MathConst
 import com.linkedin.photon.ml.data.LabeledPoint
+import com.linkedin.photon.ml.evaluation.Evaluator
 import com.linkedin.photon.ml.function._
 import com.linkedin.photon.ml.model.Coefficients
 import com.linkedin.photon.ml.normalization.NormalizationContext
 import com.linkedin.photon.ml.optimization.game.GLMOptimizationConfiguration
 import com.linkedin.photon.ml.supervised.model.{GeneralizedLinearModel, ModelTracker}
+
+import com.linkedin.photon.ml.Types.REType
+import com.linkedin.photon.ml.hyperparameter.EvaluationFunction
+import com.linkedin.photon.ml.hyperparameter.search.{GaussianProcessSearch, RandomSearch}
 
 /**
  * An optimization problem solved by a single task on one executor. Used for solving the per-entity optimization
@@ -34,12 +41,20 @@ import com.linkedin.photon.ml.supervised.model.{GeneralizedLinearModel, ModelTra
  * @param objectiveFunction The objective function to optimize
  * @param glmConstructor The function to use for producing GLMs from trained coefficients
  * @param isComputingVariances Should coefficient variances be computed in addition to the means?
+ * @param tuningEvaluator Evaluator used for hyperparameter tuning
+ * @param seed Randoms seed
  */
 protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjectiveFunction] protected[optimization] (
     optimizer: Optimizer[Objective],
     objectiveFunction: Objective,
     glmConstructor: Coefficients => GeneralizedLinearModel,
-    isComputingVariances: Boolean)
+    isComputingVariances: Boolean,
+    tuningEvaluator: Option[Evaluator] = None,
+    tuningSampleLowerBound: Int = Int.MaxValue,
+    tuningRange: (Double, Double) = (1e-3, 1e4),
+    tuningIterations: Int = 0,
+    randomEffectType: REType = "none",
+    seed: Long = System.currentTimeMillis)
   extends GeneralizedLinearOptimizationProblem[Objective](
     optimizer,
     objectiveFunction,
@@ -76,6 +91,126 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
     run(input, initializeZeroModel(input.head.features.size))
 
   /**
+   * Evaluation function to use for single-node optimization problem hyperparameter tuning
+   *
+   * TODO move this to a separate file
+   *
+   * @param optimizer The optimizer
+   * @param objectiveFunction The objective function
+   * @param initialModel The initial model
+   * @param trainInput The training set
+   * @param validationInput The validation set
+   */
+  class SingleNodeEvaluationFunction(
+      optimizer: Optimizer[Objective],
+      objectiveFunction: Objective,
+      initialModel: GeneralizedLinearModel,
+      trainInput: Iterable[LabeledPoint],
+      validationInput: Iterable[LabeledPoint])
+    extends EvaluationFunction[(GeneralizedLinearModel, Double, Double)] {
+
+    /**
+      * Performs the evaluation
+      *
+      * @param hyperParameters the vector of hyperparameter values under which to evaluate the function
+      * @return a tuple of the evaluated value and the original output from the inner estimator
+      */
+    override def apply(hyperParameters: DenseVector[Double]): (Double, (GeneralizedLinearModel, Double, Double)) = {
+      // Unpack and update regularization weight
+      val regularizationWeight = hyperParameters(0)
+      objectiveFunction match {
+        case func: L2Regularization => func.l2RegularizationWeight = regularizationWeight
+      }
+
+      // Train using the new regularization weight
+      val normalizationContext = optimizer.getNormalizationContext
+      val (optimizedCoefficients, _) = optimizer.optimize(objectiveFunction, initialModel.coefficients.means)(trainInput)
+      val optimizedVariances = computeVariances(trainInput, optimizedCoefficients)
+      val model = createModel(normalizationContext, optimizedCoefficients, optimizedVariances)
+
+      // Score the validation set with the new model
+      val scoresLabelsAndWeights = validationInput
+        .map(x => (0L, (model.computeScore(x.features) + x.offset, x.label, x.weight)))
+
+      // Evaluate the validation scores
+      val evaluation = tuningEvaluator.map { evaluator =>
+        evaluator.evaluateWithScoresAndLabelsAndWeights(scoresLabelsAndWeights)
+      }.getOrElse(0.0)
+
+      (evaluation, (model, regularizationWeight, evaluation))
+    }
+
+    /**
+      * Extracts a vector representation from the hyperparameters associated with the original estimator output
+      *
+      * @param result the original estimator output
+      * @return vector representation
+      */
+    override def vectorizeParams(result: (GeneralizedLinearModel, Double, Double)): DenseVector[Double] =
+      DenseVector(result._2)
+
+    /**
+      * Extracts the evaluated value from the original estimator output
+      *
+      * @param result the original estimator output
+      * @return the evaluated value
+      */
+    override def getEvaluationValue(result: (GeneralizedLinearModel, Double, Double)): Double = result._3
+  }
+
+  /**
+   * Runs hyperparameter optimization to find the best regularization weight, given the inputs
+   *
+   * @param input The original training data
+   * @param initialModel The initial model
+   * @param objectiveFunction The objective function
+   * @param evaluator The evaluator to use for hyperparameter metrics and selection
+   * @param trainingSetSplit The fraction of input data to use for training set during hyperparameter optimization. The
+   *   rest is held back as a validation set.
+   * @param range The range of regularization weights to explore
+   * @param iterations The number of hyperparameter tuning iterations
+   */
+  def runHyperparameterTuning(
+      input: Iterable[LabeledPoint],
+      initialModel: GeneralizedLinearModel,
+      objectiveFunction: Objective,
+      evaluator: Evaluator,
+      trainingSetSplit: Double,
+      range: (Double, Double),
+      iterations: Int): Double = {
+
+    val rand = new Random(seed)
+    val inputWithProb = input.iterator.map((rand.nextDouble, _))
+    val trainData = inputWithProb.filter(_._1 < trainingSetSplit).map(_._2).toIterable
+    val validationData = inputWithProb.filter(_._1 >= trainingSetSplit).map(_._2).toIterable
+
+    val evaluationFunction = new SingleNodeEvaluationFunction(
+      optimizer,
+      objectiveFunction,
+      initialModel,
+      trainData,
+      validationData)
+
+    // This is hanging, for some reason. Each model train / test cycle happens really fast for these sub-problems,
+    // though, so it might not be necessary since we can do a lot of evaluations
+    // val searcher = new GaussianProcessSearch[(GeneralizedLinearModel, Double, Double)](
+    //   List(range),
+    //   evaluationFunction,
+    //   evaluator,
+    //   seed = seed)
+
+    val searcher = new RandomSearch[(GeneralizedLinearModel, Double, Double)](
+      List(range),
+      evaluationFunction,
+      seed = seed)
+
+    val results = searcher.find(iterations)
+
+    // TODO use evaluator.betterThan as a comparator instead
+    results.maxBy(_._3)._2
+  }
+
+  /**
    * Run the optimization algorithm on the input data, starting from the initial model provided.
    *
    * @param input The training data
@@ -83,6 +218,27 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
    * @return The learned GLM for the given optimization problem, data, regularization type, and regularization weight
    */
   override def run(input: Iterable[LabeledPoint], initialModel: GeneralizedLinearModel): GeneralizedLinearModel = {
+    // If there's a tuning evaluator, run hyperparameter tuning to find an optimal regularization weight
+    tuningEvaluator match {
+      case Some(evaluator) if (input.size >= tuningSampleLowerBound) =>
+        val optimalRegWeight = runHyperparameterTuning(
+          input,
+          initialModel,
+          objectiveFunction,
+          evaluator,
+          0.8,
+          tuningRange,
+          tuningIterations)
+
+        logger.info(s"@!!rehyper_${randomEffectType}_${optimalRegWeight}")
+
+        objectiveFunction match {
+          case func: L2Regularization => func.l2RegularizationWeight = optimalRegWeight
+        }
+
+      case _ =>
+    }
+
     val normalizationContext = optimizer.getNormalizationContext
     val (optimizedCoefficients, _) = optimizer.optimize(objectiveFunction, initialModel.coefficients.means)(input)
     val optimizedVariances = computeVariances(input, optimizedCoefficients)
@@ -113,6 +269,7 @@ object SingleNodeOptimizationProblem {
    * @param normalizationContext The normalization context
    * @param isTrackingState Should the optimization problem record the internal optimizer states?
    * @param isComputingVariance Should coefficient variances be computed in addition to the means?
+   * @param tuningEvaluator Evaluator used for hyperparameter tuning
    * @return A new SingleNodeOptimizationProblem
    */
   def apply[Function <: SingleNodeObjectiveFunction](
@@ -121,7 +278,12 @@ object SingleNodeOptimizationProblem {
       glmConstructor: Coefficients => GeneralizedLinearModel,
       normalizationContext: Broadcast[NormalizationContext],
       isTrackingState: Boolean,
-      isComputingVariance: Boolean): SingleNodeOptimizationProblem[Function] = {
+      isComputingVariance: Boolean,
+      tuningEvaluator: Option[Evaluator] = None,
+      tuningSampleLowerBound: Int,
+      tuningRange: (Double, Double),
+      tuningIterations: Int,
+      randomEffectType: REType = "none"): SingleNodeOptimizationProblem[Function] = {
 
     val optimizerConfig = configuration.optimizerConfig
     val regularizationContext = configuration.regularizationContext
@@ -136,6 +298,11 @@ object SingleNodeOptimizationProblem {
       optimizer,
       objectiveFunction,
       glmConstructor,
-      isComputingVariance)
+      isComputingVariance,
+      tuningEvaluator,
+      tuningSampleLowerBound,
+      tuningRange,
+      tuningIterations,
+      randomEffectType)
   }
 }

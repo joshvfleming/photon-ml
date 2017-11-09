@@ -54,6 +54,20 @@ trait Evaluator {
     scoresAndLabelsAndWeights: RDD[(Long, (Double, Double, Double))]): Double
 
   /**
+   * Evaluate scores with labels and weights.
+   *
+   * @param scoresAndLabelsAndWeights A [[RDD]] of (uniqueId, (score, label, weight)) pairs
+   * @return An evaluation metric value
+   */
+  protected[ml] def evaluateWithScoresAndLabelsAndWeights(
+      scoresAndLabelsAndWeights: Iterable[(Long, (Double, Double, Double))]): Double = {
+
+    val sc = labelAndOffsetAndWeights.sparkContext
+    val rdd = sc.parallelize(scoresAndLabelsAndWeights.toSeq)
+    evaluateWithScoresAndLabelsAndWeights(rdd)
+  }
+
+  /**
    * Determine the better between two scores returned by this [[Evaluator]]. In some cases, the better score is higher
    * (e.g. AUC) and in others, the better score is lower (e.g. RMSE).
    *
