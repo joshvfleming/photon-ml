@@ -20,6 +20,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 
 import com.linkedin.photon.ml.data.RandomEffectDataSet
+import com.linkedin.photon.ml.evaluation.Evaluator
 import com.linkedin.photon.ml.function.SingleNodeObjectiveFunction
 import com.linkedin.photon.ml.model.Coefficients
 import com.linkedin.photon.ml.normalization.NormalizationContext
@@ -137,6 +138,7 @@ object RandomEffectOptimizationProblem {
    * @param glmConstructor The function to use for producing GLMs from trained coefficients
    * @param normalizationContext The normalization context
    * @param isComputingVariance Should coefficient variances be computed in addition to the means?
+   * @param tuningEvaluator Evaluator used for hyperparameter tuning
    * @return A new RandomEffectOptimizationProblem
    */
   protected[ml] def apply[RandomEffectObjective <: SingleNodeObjectiveFunction](
@@ -146,7 +148,14 @@ object RandomEffectOptimizationProblem {
       glmConstructor: Coefficients => GeneralizedLinearModel,
       normalizationContext: Broadcast[NormalizationContext],
       isTrackingState: Boolean = false,
-      isComputingVariance: Boolean = false): RandomEffectOptimizationProblem[RandomEffectObjective] = {
+      isComputingVariance: Boolean = false,
+      tuningEvaluator: Option[Evaluator] = None,
+      tuningSampleLowerBound: Int = Int.MaxValue,
+      tuningRange: (Double, Double) = (1e-3, 1e4),
+      tuningIterations: Int = 0): RandomEffectOptimizationProblem[RandomEffectObjective] = {
+
+    // TODO this is used later to log the reg weights by RE type. Find another way to track / report this
+    val randomEffectType = randomEffectDataSet.randomEffectType
 
     // Build an optimization problem for each random effect type.
     val optimizationProblems = randomEffectDataSet
@@ -157,7 +166,12 @@ object RandomEffectOptimizationProblem {
         glmConstructor,
         normalizationContext,
         isTrackingState,
-        isComputingVariance))
+        isComputingVariance,
+        tuningEvaluator,
+        tuningSampleLowerBound,
+        tuningRange,
+        tuningIterations,
+        randomEffectType))
 
     new RandomEffectOptimizationProblem(optimizationProblems, isTrackingState)
   }

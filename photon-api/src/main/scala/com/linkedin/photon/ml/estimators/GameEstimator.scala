@@ -603,6 +603,53 @@ class GameEstimator(val sc: SparkContext, implicit val logger: Logger) extends P
               variance))
 
         case (reOptConfig: RandomEffectOptimizationConfiguration, reDataSet: RandomEffectDataSetInProjectedSpace) =>
+          // TODO find another place for this, or refactor evaluators
+          val taskType = getRequiredParam(trainingTask)
+          val tuningEvaluator = taskType match {
+            case TaskType.LOGISTIC_REGRESSION =>
+              Some(new Evaluator with Serializable {
+                override val evaluatorType = EvaluatorType.AUC
+                override val labelAndOffsetAndWeights: RDD[(Long, (Double, Double, Double))] = null
+
+                override protected[ml] def evaluateWithScoresAndLabelsAndWeights(
+                  scoresAndLabelsAndWeights: RDD[(Long, (Double, Double, Double))]): Double = 0.0
+
+                override def evaluateWithScoresAndLabelsAndWeights(
+                  scoresAndLabelsAndWeights: Iterable[(Long, (Double, Double, Double))]): Double = {
+                  //AreaUnderROCCurveLocalEvaluator.evaluate(scoresAndLabelsAndWeights.map(_._2).toArray)
+
+                  -scoresAndLabelsAndWeights
+                    .map { case (_, (score, label, weight)) => weight * LogisticLossFunction.lossAndDzLoss(score, label)._1 }
+                    .reduce(_ + _)
+
+                }
+
+                override def betterThan(score1: Double, score2: Double): Boolean = score1 > score2
+              })
+
+            case TaskType.LINEAR_REGRESSION =>
+              Some(new Evaluator with Serializable {
+                override val evaluatorType = EvaluatorType.RMSE
+                override val labelAndOffsetAndWeights: RDD[(Long, (Double, Double, Double))] = null
+
+                override protected[ml] def evaluateWithScoresAndLabelsAndWeights(
+                  scoresAndLabelsAndWeights: RDD[(Long, (Double, Double, Double))]): Double = 0.0
+
+                override def evaluateWithScoresAndLabelsAndWeights(
+                  scoresAndLabelsAndWeights: Iterable[(Long, (Double, Double, Double))]): Double = {
+
+                  scoresAndLabelsAndWeights.map { case (_, (score, label, weight)) =>
+                    weight * SquaredLossFunction.lossAndDzLoss(score, label)._1
+                  }
+                    .reduce(_ + _)
+                }
+
+                override def betterThan(score1: Double, score2: Double): Boolean = score1 < score2
+              })
+
+            case _ => None
+          }
+
           new RandomEffectCoordinateInProjectedSpace(
             reDataSet,
             RandomEffectOptimizationProblem(
@@ -612,7 +659,14 @@ class GameEstimator(val sc: SparkContext, implicit val logger: Logger) extends P
                 glmConstructor,
                 normalizationContexts.extractOrElse(coordinateId)(defaultNormalizationContext),
                 TRACK_STATE,
-                variance)
+                variance,
+                tuningEvaluator,
+
+                // TODO add params for these
+                tuningSampleLowerBound = 200,
+                tuningRange = (1e-4, 1e4),
+                tuningIterations = 100
+              )
               .setName(s"Random effect optimization problem of coordinate $coordinateId")
               .persistRDD(StorageLevel.INFREQUENT_REUSE_RDD_STORAGE_LEVEL))
 
