@@ -62,6 +62,8 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
     isComputingVariances)
   with Serializable {
 
+  val rand = new Random(seed)
+
   /**
    * Compute coefficient variances
    *
@@ -107,7 +109,7 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
       initialModel: GeneralizedLinearModel,
       trainInput: Iterable[LabeledPoint],
       validationInput: Iterable[LabeledPoint])
-    extends EvaluationFunction[(GeneralizedLinearModel, Double, Double)] {
+    extends EvaluationFunction[(Double, Double)] {
 
     /**
       * Performs the evaluation
@@ -115,7 +117,7 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
       * @param hyperParameters the vector of hyperparameter values under which to evaluate the function
       * @return a tuple of the evaluated value and the original output from the inner estimator
       */
-    override def apply(hyperParameters: DenseVector[Double]): (Double, (GeneralizedLinearModel, Double, Double)) = {
+    override def apply(hyperParameters: DenseVector[Double]): (Double, (Double, Double)) = {
       // Unpack and update regularization weight
       val regularizationWeight = hyperParameters(0)
       objectiveFunction match {
@@ -130,14 +132,14 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
 
       // Score the validation set with the new model
       val scoresLabelsAndWeights = validationInput
-        .map(x => (0L, (model.computeScore(x.features) + x.offset, x.label, x.weight)))
+        .map(x => (0L, (model.computeMean(x.features, x.offset), x.label, x.weight)))
 
       // Evaluate the validation scores
       val evaluation = tuningEvaluator.map { evaluator =>
         evaluator.evaluateWithScoresAndLabelsAndWeights(scoresLabelsAndWeights)
       }.getOrElse(0.0)
 
-      (evaluation, (model, regularizationWeight, evaluation))
+      (evaluation, (regularizationWeight, evaluation))
     }
 
     /**
@@ -146,8 +148,8 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
       * @param result the original estimator output
       * @return vector representation
       */
-    override def vectorizeParams(result: (GeneralizedLinearModel, Double, Double)): DenseVector[Double] =
-      DenseVector(result._2)
+    override def vectorizeParams(result: (Double, Double)): DenseVector[Double] =
+      DenseVector(result._1)
 
     /**
       * Extracts the evaluated value from the original estimator output
@@ -155,7 +157,7 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
       * @param result the original estimator output
       * @return the evaluated value
       */
-    override def getEvaluationValue(result: (GeneralizedLinearModel, Double, Double)): Double = result._3
+    override def getEvaluationValue(result: (Double, Double)): Double = result._2
   }
 
   /**
@@ -173,16 +175,25 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
   def runHyperparameterTuning(
       input: Iterable[LabeledPoint],
       initialModel: GeneralizedLinearModel,
+      initialWeight: Double,
       objectiveFunction: Objective,
       evaluator: Evaluator,
       trainingSetSplit: Double,
       range: (Double, Double),
-      iterations: Int): Double = {
+      iterations: Int,
+      positiveExampleLowerBound: Int = 1,
+      negativeExampleLowerBound: Int = 1): Option[Double] = {
 
-    val rand = new Random(seed)
-    val inputWithProb = input.iterator.map((rand.nextDouble, _))
+    val inputWithProb = input.map((rand.nextDouble, _))
     val trainData = inputWithProb.filter(_._1 < trainingSetSplit).map(_._2).toIterable
     val validationData = inputWithProb.filter(_._1 >= trainingSetSplit).map(_._2).toIterable
+
+    if (trainData.count(_.label > 0) < positiveExampleLowerBound
+      || trainData.count(_.label <= 0) < negativeExampleLowerBound
+      || validationData.count(_.label > 0) < positiveExampleLowerBound
+      || validationData.count(_.label <= 0) < negativeExampleLowerBound) {
+      return None
+    }
 
     val evaluationFunction = new SingleNodeEvaluationFunction(
       optimizer,
@@ -190,6 +201,8 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
       initialModel,
       trainData,
       validationData)
+
+    val (initialEval, _) = evaluationFunction(DenseVector(initialWeight))
 
     // This is hanging, for some reason. Each model train / test cycle happens really fast for these sub-problems,
     // though, so it might not be necessary since we can do a lot of evaluations
@@ -199,7 +212,7 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
     //   evaluator,
     //   seed = seed)
 
-    val searcher = new RandomSearch[(GeneralizedLinearModel, Double, Double)](
+    val searcher = new RandomSearch[(Double, Double)](
       List(range),
       evaluationFunction,
       seed = seed)
@@ -207,7 +220,13 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
     val results = searcher.find(iterations)
 
     // TODO use evaluator.betterThan as a comparator instead
-    results.maxBy(_._3)._2
+    val (bestWeight, bestEval) = results.maxBy(_._2)
+    if (!bestEval.isNaN && !bestEval.isInfinite && bestEval > initialEval) {
+      logger.info(s"@!!rehyper_imp_${randomEffectType}_${bestEval/initialEval - 1}")
+      Some(bestWeight)
+    } else {
+      None
+    }
   }
 
   /**
@@ -221,19 +240,22 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
     // If there's a tuning evaluator, run hyperparameter tuning to find an optimal regularization weight
     tuningEvaluator match {
       case Some(evaluator) if (input.size >= tuningSampleLowerBound) =>
-        val optimalRegWeight = runHyperparameterTuning(
-          input,
-          initialModel,
-          objectiveFunction,
-          evaluator,
-          0.8,
-          tuningRange,
-          tuningIterations)
-
-        logger.info(s"@!!rehyper_${randomEffectType}_${optimalRegWeight}")
-
         objectiveFunction match {
-          case func: L2Regularization => func.l2RegularizationWeight = optimalRegWeight
+          case func: L2Regularization =>
+            val optimalRegWeight = runHyperparameterTuning(
+              input,
+              initialModel,
+              func.l2RegularizationWeight,
+              objectiveFunction,
+              evaluator,
+              0.8,
+              tuningRange,
+              tuningIterations)
+
+            optimalRegWeight.foreach { weight =>
+              logger.info(s"@!!rehyper_${randomEffectType}_${weight}")
+              func.l2RegularizationWeight = weight
+            }
         }
 
       case _ =>
