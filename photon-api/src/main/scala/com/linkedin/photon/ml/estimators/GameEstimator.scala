@@ -576,9 +576,9 @@ class GameEstimator(val sc: SparkContext, implicit val logger: Logger) {
                   tuningEvaluator,
 
                   // TODO add params for these
-                  tuningSampleLowerBound = 100,
-                  tuningRange = (1e-5, 1e5),
-                  tuningIterations = 500
+                  tuningSampleLowerBound = 200,
+                  tuningRange = (1e-4, 1e4),
+                  tuningIterations = 300
               )
                 .setName(s"Random effect optimization problem of coordinate $coordinateId")
                 .persistRDD(StorageLevel.INFREQUENT_REUSE_RDD_STORAGE_LEVEL))

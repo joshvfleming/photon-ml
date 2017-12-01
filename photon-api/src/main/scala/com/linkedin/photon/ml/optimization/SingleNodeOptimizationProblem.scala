@@ -14,6 +14,8 @@
  */
 package com.linkedin.photon.ml.optimization
 
+import scala.collection.mutable
+import scala.math.{exp, log}
 import scala.util.Random
 
 import breeze.linalg.{DenseVector, Vector}
@@ -107,19 +109,19 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
       optimizer: Optimizer[Objective],
       objectiveFunction: Objective,
       initialModel: GeneralizedLinearModel,
-      trainInput: Iterable[LabeledPoint],
-      validationInput: Iterable[LabeledPoint])
+      input: Iterable[LabeledPoint],
+      trainingSetSplit: Double,
+      positiveExampleLowerBound: Int,
+      negativeExampleLowerBound: Int)
     extends EvaluationFunction[(Double, Double)] {
 
-    /**
-      * Performs the evaluation
-      *
-      * @param hyperParameters the vector of hyperparameter values under which to evaluate the function
-      * @return a tuple of the evaluated value and the original output from the inner estimator
-      */
-    override def apply(hyperParameters: DenseVector[Double]): (Double, (Double, Double)) = {
+    private def evaluate(
+        trainInput: Iterable[LabeledPoint],
+        validationInput: Iterable[LabeledPoint],
+        hyperParameters: DenseVector[Double]): (Double, (Double, Double)) = {
+
       // Unpack and update regularization weight
-      val regularizationWeight = hyperParameters(0)
+      val regularizationWeight = exp(hyperParameters(0))
       objectiveFunction match {
         case func: L2Regularization => func.l2RegularizationWeight = regularizationWeight
       }
@@ -140,6 +142,59 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
       }.getOrElse(0.0)
 
       (evaluation, (regularizationWeight, evaluation))
+    }
+
+    /**
+      * Performs the evaluation
+      *
+      * @param hyperParameters the vector of hyperparameter values under which to evaluate the function
+      * @return a tuple of the evaluated value and the original output from the inner estimator
+      */
+    override def apply(hyperParameters: DenseVector[Double]): (Double, (Double, Double)) = {
+      val shuffled = input
+        .map((rand.nextDouble, _))
+        .toArray
+        .sortBy(_._1)
+        .map(_._2)
+
+      val testSetSize = ((1 - trainingSetSplit) * input.size).toInt
+      val folds = shuffled
+        .grouped(testSetSize)
+        .toList
+
+      var pre = Seq[Array[LabeledPoint]]()
+      var post = folds
+
+      var results = new mutable.ArrayBuffer[(Double, (Double, Double))]
+
+      while (!post.isEmpty) {
+        val trainData = pre.foldLeft(Array[LabeledPoint]())(_ ++ _) ++
+          post.tail.foldLeft(Array[LabeledPoint]())(_ ++ _)
+        val validationData = post.head
+
+        if (trainData.count(_.label > 0) >= positiveExampleLowerBound
+          && trainData.count(_.label <= 0) >= negativeExampleLowerBound
+          && validationData.count(_.label > 0) >= positiveExampleLowerBound
+          && validationData.count(_.label <= 0) >= negativeExampleLowerBound) {
+
+          results += evaluate(trainData, validationData, hyperParameters)
+        }
+
+        pre = pre :+ post.head
+        post = post.tail
+      }
+
+      val evaluations = results
+        .map(_._1)
+        .filter(e => !e.isNaN && !e.isInfinity)
+
+      val meanEvaluation = if (evaluations.nonEmpty) {
+        evaluations.reduce(_ + _) / evaluations.length
+      } else {
+        Double.NegativeInfinity
+      }
+
+      (meanEvaluation, (exp(hyperParameters(0)), meanEvaluation))
     }
 
     /**
@@ -184,25 +239,16 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
       positiveExampleLowerBound: Int = 1,
       negativeExampleLowerBound: Int = 1): Option[Double] = {
 
-    val inputWithProb = input.map((rand.nextDouble, _))
-    val trainData = inputWithProb.filter(_._1 < trainingSetSplit).map(_._2).toIterable
-    val validationData = inputWithProb.filter(_._1 >= trainingSetSplit).map(_._2).toIterable
-
-    if (trainData.count(_.label > 0) < positiveExampleLowerBound
-      || trainData.count(_.label <= 0) < negativeExampleLowerBound
-      || validationData.count(_.label > 0) < positiveExampleLowerBound
-      || validationData.count(_.label <= 0) < negativeExampleLowerBound) {
-      return None
-    }
-
     val evaluationFunction = new SingleNodeEvaluationFunction(
       optimizer,
       objectiveFunction,
       initialModel,
-      trainData,
-      validationData)
+      input,
+      trainingSetSplit,
+      positiveExampleLowerBound,
+      negativeExampleLowerBound)
 
-    val (initialEval, _) = evaluationFunction(DenseVector(initialWeight))
+    val (initialEval, _) = evaluationFunction(DenseVector(log(initialWeight)))
 
     // This is hanging, for some reason. Each model train / test cycle happens really fast for these sub-problems,
     // though, so it might not be necessary since we can do a lot of evaluations
@@ -213,7 +259,7 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
     //   seed = seed)
 
     val searcher = new RandomSearch[(Double, Double)](
-      List(range),
+      List((log(range._1), log(range._2))),
       evaluationFunction,
       seed = seed)
 
@@ -221,7 +267,10 @@ protected[ml] class SingleNodeOptimizationProblem[Objective <: SingleNodeObjecti
 
     // TODO use evaluator.betterThan as a comparator instead
     val (bestWeight, bestEval) = results.maxBy(_._2)
-    if (!bestEval.isNaN && !bestEval.isInfinite && bestEval > initialEval) {
+    if (!bestEval.isNaN && !bestEval.isInfinite
+      && !initialEval.isNaN && !initialEval.isInfinite
+      && bestEval > initialEval) {
+
       logger.info(s"@!!rehyper_imp_${randomEffectType}_${bestEval/initialEval - 1}")
       Some(bestWeight)
     } else {
